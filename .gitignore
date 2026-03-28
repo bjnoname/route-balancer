@@ -1,0 +1,18 @@
+# Build output
+/route-balancer
+
+# AI assistant context
+/CLAUDE.md
+
+# Nix build results
+/result
+/result-*
+
+# direnv
+/.direnv/
+
+# Go
+/vendor/
+
+# QEMU
+*.qcow2
