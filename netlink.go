@@ -31,6 +31,7 @@ const (
 // Route message field values
 const (
 	RT_TABLE_MAIN = 254
+	RTPROT_BOOT   = 3 // used by pppd for the route it installs on link-up
 	RTPROT_STATIC = 4
 	RTPROT_DHCP   = 16
 	RT_SCOPE_LINK = 253
@@ -126,7 +127,10 @@ func parseRouteEvent(data []byte) (msgType uint16, gw Gateway, ok bool) {
 		attrData = attrData[aligned:]
 	}
 
-	if gwIP == nil || ifIndex == 0 {
+	// A missing RTA_GATEWAY is a legitimate state: point-to-point links (PPP,
+	// tunnels) install "default dev <if> scope link" because there is no
+	// address to route via. Only the output interface is mandatory.
+	if ifIndex == 0 {
 		return
 	}
 

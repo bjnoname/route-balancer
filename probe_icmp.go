@@ -25,6 +25,12 @@ func (p *ICMPProbe) String() string {
 }
 
 func (p *ICMPProbe) Check(ctx context.Context, target Target) error {
+	// Point-to-point links have no nexthop address, so there is nothing to
+	// echo against. Fail loudly rather than silently pinging 0.0.0.0.
+	if len(target.GatewayIP) == 0 {
+		return fmt.Errorf("no nexthop address on %s: icmp cannot probe a point-to-point link, use an http, tcp, dns, or exec probe", target.IfName)
+	}
+
 	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_ICMP)
 	if err != nil {
 		return fmt.Errorf("socket: %w", err)

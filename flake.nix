@@ -122,6 +122,10 @@
 
             # NixOS VM integration test — health probe types (ICMP/HTTP/TCP/DNS/exec)
             health-probes-vm = import ./nix/tests/health-probes.nix { inherit pkgs; };
+
+            # NixOS VM integration test — nexthop-less (point-to-point) uplinks,
+            # reconcile stability, and teardown after an address is withdrawn
+            point-to-point-vm = import ./nix/tests/point-to-point.nix { inherit pkgs; };
           };
         };
     };

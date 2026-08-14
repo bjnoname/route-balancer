@@ -183,6 +183,11 @@ func startMonitor(gw Gateway) {
 		return
 	}
 
+	if !gw.hasNexthop() && isICMPProbe(gwCfg.Health.Probe) {
+		slog.Warn("ICMP probe configured on a point-to-point link, which has no nexthop address to ping — "+
+			"the probe will always fail; use an http, tcp, dns, or exec probe instead", "iface", gw.IfName)
+	}
+
 	key := gwKey(gw.IP, gw.IfIndex)
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -214,6 +219,17 @@ func stopAllMonitors() {
 	for key, cancel := range monitors {
 		cancel()
 		delete(monitors, key)
+	}
+}
+
+// isICMPProbe reports whether pcfg selects the ICMP probe, which is also the
+// default when no type is given.
+func isICMPProbe(pcfg ProbeConfig) bool {
+	switch pcfg.Type {
+	case "http", "https", "tcp", "dns", "exec":
+		return false
+	default:
+		return true
 	}
 }
 

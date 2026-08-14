@@ -14,6 +14,10 @@ removed from ECMP immediately. When it reappears it is re-added. Interfaces not 
 the `gateways` config (or with `weight = 0`) are silently ignored, so you can safely run
 it alongside other interfaces that route-balancer should not touch.
 
+Point-to-point uplinks are supported. PPPoE links, WireGuard, and other tunnels install a
+default route with no nexthop address (`default dev ppp0 scope link`) because there is
+nothing to route *via*; those interfaces join ECMP keyed on the interface itself.
+
 Optional per-gateway health probes (ICMP, HTTP, TCP, DNS, or a custom script) let the
 daemon remove a gateway from ECMP before the kernel route disappears — for example when
 an ISP is up at layer 2 but dropping packets upstream. Probes use `SO_BINDTODEVICE` so
@@ -219,6 +223,11 @@ applyECMP():
    ip route add default metric 0 proto 111
    nexthop via gw1 dev eth0 weight 3
    nexthop via gw2 dev eth1 weight 1
+   nexthop dev ppp0 weight 1          ← point-to-point links carry no "via"
+
+reconcile() (every reconcileInterval):
+   prunes gateways whose default route has vanished from the kernel,
+   then restores the ECMP route, per-gateway tables, and ip rules if they drifted
 
 Port-based rules (matchDstPort):
    iptables backend: iptables -t mangle ROUTE-BALANCER chain → MARK --set-mark N
@@ -245,6 +254,10 @@ rather than the current default route.
 | `tcp`  | Layer 4 TCP connect                    | `host`, `port`                                 |
 | `dns`  | DNS resolver reachability              | `resolver` (host:port), `query`                |
 | `exec` | Custom script (exit 0 = healthy)       | `command` (list)                               |
+
+`icmp` needs a nexthop address to ping, so it cannot probe a point-to-point link
+(PPP, tunnels) — those have none. Use `http`, `tcp`, `dns`, or `exec` there; the
+daemon warns if an ICMP probe is configured on one.
 
 Gateways without a health config are always considered healthy.
 Gateways start optimistic (healthy) on daemon startup so ECMP is restored immediately

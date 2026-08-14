@@ -112,8 +112,12 @@ func main() {
 		startMonitor(gw)
 	}
 
-	if len(gateways) > 1 {
-		slog.Info("Multiple gateways found on startup — applying ECMP immediately")
+	// Apply immediately for any number of seeded gateways: a host with a
+	// single uplink still needs the metric-0 route installed, and waiting for
+	// a second route event (or the first reconcile tick) would leave it
+	// unmanaged until then.
+	if len(seeded) > 0 {
+		slog.Info("Gateways found on startup — applying ECMP immediately", "count", len(seeded))
 		applyECMP()
 	}
 
@@ -184,12 +188,22 @@ func main() {
 			applyECMP()
 
 		case RTM_DELROUTE:
-			slog.Info("Default route removed", "gateway", gw)
-			stopMonitor(key)
-			teardownGatewayRoutes(gw)
+			// Tear down using the stored Gateway rather than the one parsed
+			// from the event: it carries the source address cached at setup
+			// time, which the interface itself may no longer have.
 			gatewaysMu.Lock()
+			stored, known := gateways[key]
 			delete(gateways, key)
 			gatewaysMu.Unlock()
+
+			if !known {
+				slog.Debug("Ignoring route removal for untracked gateway", "gateway", gw)
+				continue
+			}
+
+			slog.Info("Default route removed", "gateway", stored)
+			stopMonitor(key)
+			teardownGatewayRoutes(stored)
 			applyECMP()
 		}
 	}
