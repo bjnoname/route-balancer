@@ -68,7 +68,7 @@ in
             DHCP = "no";
           };
           # High metric so route-balancer can install its ECMP route at metric 0.
-          routes = [{ routeConfig = { Gateway = "10.0.0.1"; Metric = 50; }; }];
+          routes = [{ Gateway = "10.0.0.1"; Metric = 50; }];
         };
         "10-eth1" = {
           matchConfig.Name = "eth1";

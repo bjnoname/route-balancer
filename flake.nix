@@ -2,7 +2,7 @@
   description = "route-balancer — Reactive ECMP load-balanced gateway daemon for NixOS";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     flake-parts.url = "github:hercules-ci/flake-parts";
     treefmt-nix.url = "github:numtide/treefmt-nix";
     claude-code.url = "github:sadjow/claude-code-nix";
