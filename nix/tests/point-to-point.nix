@@ -1,23 +1,3 @@
-# nix/tests/point-to-point.nix
-#
-# NixOS VM integration test for uplinks that have no nexthop address.
-#
-# PPP links (and other point-to-point uplinks — WireGuard, tunnels) install
-#
-#   default dev ppp-ee proto boot scope link metric 51
-#
-# with no RTA_GATEWAY, because there is no address to route via. A dummy
-# interface carrying a /32 address and a scope-link default route reproduces
-# exactly that shape on the netlink wire without needing a PPPoE server.
-#
-# Also covers two failures that surfaced alongside it:
-#   - a lone gateway configured above weight 1 being reconciled forever,
-#     because the kernel drops the weight token for single-path routes;
-#   - the split-access ip rule leaking when an interface loses its address,
-#     which the kernel does without emitting a route delete event.
-#
-# Run with: nix build .#checks.x86_64-linux.point-to-point-vm
-
 { pkgs }:
 
 pkgs.testers.nixosTest {
@@ -28,7 +8,6 @@ pkgs.testers.nixosTest {
 
     virtualisation.vlans = [ 1 ];
 
-    # ptp0 stands in for a PPP interface; it is created by the test script.
     boot.kernelModules = [ "dummy" ];
 
     networking = {
@@ -40,13 +19,9 @@ pkgs.testers.nixosTest {
       enable = true;
       package = pkgs.callPackage ../pkgs/route-balancer.nix { };
       gateways = {
-        # Weights above 1 on purpose: weight 1 accidentally matches the value
-        # the kernel implies for a single-path route, which is what hid the
-        # reconcile loop until now.
         eth1 = { weight = 5; };
         ptp0 = { weight = 3; };
       };
-      # Short interval so the reconcile assertions do not have to wait long.
       reconcileInterval = "2s";
     };
   };
@@ -55,20 +30,29 @@ pkgs.testers.nixosTest {
     machine.wait_for_unit("network.target")
     machine.wait_for_unit("route-balancer.service")
 
-    def churn_count():
-        """Number of 'modified externally' warnings logged so far."""
+    def install_count():
+        """How many times the differ has decided a resource needs installing.
+
+        A converged daemon plans nothing: every InSync hook agrees with the
+        spec the calculator asked for, so a reconcile pass emits no
+        'Installing' line at all. One appearing while nothing on the machine
+        has changed means a spec and the drift read of that same resource
+        disagree, so the daemon re-applies it every single pass.
+        """
         return int(machine.succeed(
             "journalctl -u route-balancer.service --no-pager | "
-            "grep -c 'modified externally' || true"
+            "grep -c 'msg=Installing' || true"
         ).strip())
 
     def assert_no_churn(seconds, what):
-        before = churn_count()
+        before = install_count()
         machine.sleep(seconds)
-        after = churn_count()
+        after = install_count()
+        passes = seconds // 2
         assert after == before, (
-            f"{what}: {after - before} spurious reconcile restore(s) in {seconds}s "
-            f"(reconcile interval is 2s)"
+            f"{what}: {after - before} spurious (re)install(s) in {seconds}s — "
+            f"the reconcile interval is 2s, so those {passes} passes should have "
+            f"planned nothing"
         )
 
     eth1_idx = int(machine.succeed("cat /sys/class/net/eth1/ifindex").strip())
@@ -100,8 +84,7 @@ pkgs.testers.nixosTest {
         machine.wait_until_succeeds(
             f"ip route show table {tablep} | grep -q 'src 10.9.9.2'", timeout=15,
         )
-        # A /32 address has no subnet beyond the host itself, so no subnet
-        # route may be derived from it — the table holds the default route only.
+        # A /32 has no subnet route: the table holds the default route only.
         routes = machine.succeed(f"ip route show table {tablep} | grep -c .").strip()
         assert routes == "1", f"table {tablep} has {routes} routes, want only the default route"
         # Split-access rule
@@ -157,24 +140,17 @@ pkgs.testers.nixosTest {
         machine.wait_until_fails(
             f"ip route show table {tablep} | grep -q .", timeout=15,
         )
-        # eth1 is now the only gateway, and the kernel stores it as a plain
-        # single-path route with no weight token.
+        # A single-path route is stored with no weight token.
         machine.wait_until_succeeds(
             "ip route show default metric 0 | grep -q 'via 10.0.1.1 dev eth1'", timeout=15,
         )
 
     # ── 6. A lone nexthop gateway above weight 1 does not churn ──────────────
-    # Regression: the expected set carries weight 5 while `ip route show` prints
-    # no weight at all for a single-path route. Comparing the two declared
-    # external modification on every tick and re-applied the route forever.
     with subtest("no reconcile churn: lone nexthop gateway at weight 5"):
         assert_no_churn(8, "nexthop gateway at weight 5")
 
     # ── 7. Losing an address must not leak the rule or the table ─────────────
-    # The kernel drops routes that depend on a withdrawn address without
-    # emitting RTM_DELROUTE, so the daemon must notice the gateway is gone on
-    # its own. Live evidence of the leak: an ip rule for an interface whose
-    # DHCP lease had expired hours earlier.
+    # The kernel drops the routes without emitting RTM_DELROUTE.
     with subtest("gateway losing its address is torn down, leaving no ip rule"):
         machine.succeed(f"ip rule show | grep -q 'from 10.0.1.2 lookup {table1}'")
         machine.succeed("ip addr flush dev eth1")

@@ -1,0 +1,40 @@
+# mdBook configuration — the docs/ folder rendered as a book.
+#
+# Build it with `nix build .#docs`, serve it with `nix run .#docs`. Both go
+# through nix/pkgs/docs.nix, which is also what `nix flake check` runs, so a
+# broken SUMMARY link or an unparsable diagram fails the same way a broken
+# build does.
+
+[book]
+title = "route-balancer"
+description = "Reactive ECMP load-balanced default gateway daemon for Linux/NixOS"
+authors = ["jordy"]
+src = "docs"
+language = "en"
+
+[build]
+build-dir = "book"
+# A SUMMARY.md entry pointing at a file that is not there is a broken book,
+# not a page to be created on the fly.
+create-missing = false
+
+# Turns ```mermaid fences into <pre class="mermaid"> for the runtime to draw.
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
+
+[output.html]
+default-theme = "light"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/bjnoname/route-balancer"
+edit-url-template = "https://github.com/bjnoname/route-balancer/edit/main/{path}"
+
+# mermaid.min.js is written by `mdbook-mermaid install` at build time (it is
+# 2.6 MB and is not in git); mermaid-init.js is ours — see nix/docs/.
+#
+# docs/module-options.md is generated from the NixOS module the same way, so it
+# is not in git either. Build the book through nix, not by running mdbook here.
+additional-js = ["mermaid.min.js", "mermaid-init.js"]
+
+[output.html.fold]
+enable = true
+level = 1
