@@ -1,34 +1,9 @@
-# nix/tests/health-probes.nix
-#
-# NixOS VM integration test for route-balancer health probes.
-#
-# Exercises ICMP, HTTP, TCP, DNS, and exec probe types end-to-end.
-# Each probe is assigned its own gateway so failures can be isolated.
-#
-# Run with: nix build .#checks.x86_64-linux.health-probes-vm
-#
-# Topology
-# ────────
-#   machine  ── VLAN 1 ──  router1  (10.0.1.1)  ICMP probe target
-#            ── VLAN 2 ──  router2  (10.0.2.1)  HTTP probe target  (nginx)
-#            ── VLAN 3 ──  router2  (10.0.3.1)  TCP probe target   (same nginx)
-#            ── VLAN 4 ──  router3  (10.0.4.1)  DNS probe target   (dnsmasq)
-#            ── VLAN 5 ──  (none)   (10.0.5.1)  exec probe — flag-file command,
-#                                               no peer VM needed
-#
-# All probes use fast parameters (1 s interval, 2-of-2 thresholds) so that
-# failure detection and recovery each complete within ~3 seconds.
-
 { pkgs }:
 
 pkgs.testers.nixosTest {
   name = "route-balancer-health-probes";
 
-  # ── Nodes ──────────────────────────────────────────────────────────────────
-
   nodes = {
-
-    # ── DUT: runs route-balancer with one health-monitored gateway per probe type
     machine = { lib, pkgs, ... }: {
       imports = [ (import ../module/route-balancer.nix) ];
 
@@ -37,11 +12,26 @@ pkgs.testers.nixosTest {
       networking = {
         useDHCP = lib.mkForce false;
         interfaces = {
-          eth1.ipv4.addresses = [{ address = "10.0.1.2"; prefixLength = 24; }];
-          eth2.ipv4.addresses = [{ address = "10.0.2.2"; prefixLength = 24; }];
-          eth3.ipv4.addresses = [{ address = "10.0.3.2"; prefixLength = 24; }];
-          eth4.ipv4.addresses = [{ address = "10.0.4.2"; prefixLength = 24; }];
-          eth5.ipv4.addresses = [{ address = "10.0.5.2"; prefixLength = 24; }];
+          eth1 = {
+            ipv4.addresses = [{ address = "10.0.1.2"; prefixLength = 24; }];
+            ipv6.addresses = [{ address = "2001:db8:a1::2"; prefixLength = 64; }];
+          };
+          eth2 = {
+            ipv4.addresses = [{ address = "10.0.2.2"; prefixLength = 24; }];
+            ipv6.addresses = [{ address = "2001:db8:a2::2"; prefixLength = 64; }];
+          };
+          eth3 = {
+            ipv4.addresses = [{ address = "10.0.3.2"; prefixLength = 24; }];
+            ipv6.addresses = [{ address = "2001:db8:a3::2"; prefixLength = 64; }];
+          };
+          eth4 = {
+            ipv4.addresses = [{ address = "10.0.4.2"; prefixLength = 24; }];
+            ipv6.addresses = [{ address = "2001:db8:a4::2"; prefixLength = 64; }];
+          };
+          eth5 = {
+            ipv4.addresses = [{ address = "10.0.5.2"; prefixLength = 24; }];
+            ipv6.addresses = [{ address = "2001:db8:a5::2"; prefixLength = 64; }];
+          };
         };
       };
 
@@ -49,8 +39,10 @@ pkgs.testers.nixosTest {
         enable = true;
         package = pkgs.callPackage ../pkgs/route-balancer.nix { };
 
+        ipv6Ecmp = true;
+        ipv6Metric = 5;
+
         gateways = {
-          # eth1 — ICMP probe: send echo request to gateway IP, expect reply.
           eth1 = {
             weight = 1;
             health = {
@@ -62,7 +54,6 @@ pkgs.testers.nixosTest {
             };
           };
 
-          # eth2 — HTTP probe: GET http://10.0.2.1/, expect 200.
           eth2 = {
             weight = 1;
             health = {
@@ -75,10 +66,14 @@ pkgs.testers.nixosTest {
                 url = "http://10.0.2.1/";
                 expectedStatus = [ 200 ];
               };
+              probe6 = {
+                type = "http";
+                url = "http://[2001:db8:a2::1]/";
+                expectedStatus = [ 200 ];
+              };
             };
           };
 
-          # eth3 — TCP probe: connect to 10.0.3.1:80 (same nginx on router2, VLAN 3).
           eth3 = {
             weight = 1;
             health = {
@@ -91,10 +86,14 @@ pkgs.testers.nixosTest {
                 host = "10.0.3.1";
                 port = 80;
               };
+              probe6 = {
+                type = "tcp";
+                host = "2001:db8:a3::1";
+                port = 80;
+              };
             };
           };
 
-          # eth4 — DNS probe: query test.local from dnsmasq on router3.
           eth4 = {
             weight = 1;
             health = {
@@ -107,10 +106,14 @@ pkgs.testers.nixosTest {
                 resolver = "10.0.4.1:53";
                 query = "test.local";
               };
+              probe6 = {
+                type = "dns";
+                resolver = "2001:db8:a4::1";
+                query = "test.local";
+              };
             };
           };
 
-          # eth5 — exec probe: check for a flag file; no peer VM needed.
           eth5 = {
             weight = 1;
             health = {
@@ -127,33 +130,34 @@ pkgs.testers.nixosTest {
         };
       };
 
-      # Create the exec probe flag file at boot so eth5 starts healthy.
       systemd.tmpfiles.rules = [ "f /run/health-exec-flag 0644 root root - -" ];
     };
 
-    # ── router1: ICMP probe target.
-    # The default NixOS firewall (enabled) brings in the iptables binary and
-    # allows ping.  The test inserts/deletes a DROP rule to simulate failure.
     router1 = { lib, ... }: {
       virtualisation.vlans = [ 1 ];
       networking = {
         useDHCP = lib.mkForce false;
-        interfaces.eth1.ipv4.addresses = [{ address = "10.0.1.1"; prefixLength = 24; }];
-        # Keep the default firewall enabled — it provides the iptables binary
-        # and allows ICMP by default (allowPing = true).
+        interfaces.eth1 = {
+          ipv4.addresses = [{ address = "10.0.1.1"; prefixLength = 24; }];
+          ipv6.addresses = [{ address = "2001:db8:a1::1"; prefixLength = 64; }];
+        };
         firewall.allowPing = true;
       };
     };
 
-    # ── router2: HTTP and TCP probe target — runs nginx on both VLAN 2 and VLAN 3.
-    # eth1 = 10.0.2.1 (VLAN 2, HTTP probe), eth2 = 10.0.3.1 (VLAN 3, TCP probe).
     router2 = { lib, pkgs, ... }: {
       virtualisation.vlans = [ 2 3 ];
       networking = {
         useDHCP = lib.mkForce false;
         interfaces = {
-          eth1.ipv4.addresses = [{ address = "10.0.2.1"; prefixLength = 24; }];
-          eth2.ipv4.addresses = [{ address = "10.0.3.1"; prefixLength = 24; }];
+          eth1 = {
+            ipv4.addresses = [{ address = "10.0.2.1"; prefixLength = 24; }];
+            ipv6.addresses = [{ address = "2001:db8:a2::1"; prefixLength = 64; }];
+          };
+          eth2 = {
+            ipv4.addresses = [{ address = "10.0.3.1"; prefixLength = 24; }];
+            ipv6.addresses = [{ address = "2001:db8:a3::1"; prefixLength = 64; }];
+          };
         };
         firewall.allowedTCPPorts = [ 80 ];
       };
@@ -171,35 +175,30 @@ pkgs.testers.nixosTest {
       };
     };
 
-    # ── router3: DNS probe target — runs dnsmasq serving test.local.
     router3 = { lib, pkgs, ... }: {
       virtualisation.vlans = [ 4 ];
       networking = {
         useDHCP = lib.mkForce false;
-        interfaces.eth1.ipv4.addresses = [{ address = "10.0.4.1"; prefixLength = 24; }];
+        interfaces.eth1 = {
+          ipv4.addresses = [{ address = "10.0.4.1"; prefixLength = 24; }];
+          ipv6.addresses = [{ address = "2001:db8:a4::1"; prefixLength = 64; }];
+        };
         firewall.allowedTCPPorts = [ 53 ];
         firewall.allowedUDPPorts = [ 53 ];
       };
       services.dnsmasq = {
         enable = true;
-        # Prevent dnsmasq from becoming the system resolver for router3 itself.
         resolveLocalQueries = false;
         settings = {
-          # Listen only on the VLAN 4 interface so it doesn't interfere with
-          # other networking on the VM.
           bind-interfaces = true;
-          listen-address = "10.0.4.1";
-          # Serve a static record so the probe always gets a NOERROR response
-          # even without an upstream DNS server in the test environment.
+          listen-address = "10.0.4.1,2001:db8:a4::1";
           address = "/test.local/10.0.4.1";
-          # Don't forward to /etc/resolv.conf — no real upstream in VM.
           no-resolv = true;
         };
       };
     };
   };
 
-  # ── Test script ────────────────────────────────────────────────────────────
   testScript = ''
     start_all()
 
@@ -210,32 +209,41 @@ pkgs.testers.nixosTest {
     router2.wait_for_unit("nginx.service")
     router3.wait_for_unit("dnsmasq.service")
 
-    # Add one default route per gateway so route-balancer seeds them into its
-    # gateway map and starts a health monitor for each.  Gateways start
-    # optimistic (HEALTHY) so they enter ECMP immediately without waiting for
-    # the first probe cycle.
+    # One default route per gateway, so each is seeded and gets a monitor.
     machine.succeed("ip route add default via 10.0.1.1 dev eth1 metric 500")
     machine.succeed("ip route add default via 10.0.2.1 dev eth2 metric 600")
     machine.succeed("ip route add default via 10.0.3.1 dev eth3 metric 700")
     machine.succeed("ip route add default via 10.0.4.1 dev eth4 metric 800")
     machine.succeed("ip route add default via 10.0.5.1 dev eth5 metric 900")
 
-    # Helper: assert that a gateway IP appears (or not) as a nexthop in the
-    # ECMP route installed by route-balancer (proto 111, metric 0).
+    # And one per link in IPv6, so each link's second monitor has a nexthop.
+    V6_NEXTHOP = {
+        "eth1": "2001:db8:a1::1",
+        "eth2": "2001:db8:a2::1",
+        "eth3": "2001:db8:a3::1",
+        "eth4": "2001:db8:a4::1",
+        "eth5": "2001:db8:a5::1",
+    }
+    for i, (dev, gw) in enumerate(V6_NEXTHOP.items()):
+        # One metric each: IPv6 refuses a second route at the same metric.
+        machine.succeed(f"ip -6 route add default via {gw} dev {dev} metric {1024 + i}")
+
+    # Assert whether a gateway IP is a nexthop in the managed ECMP route.
     def in_ecmp(gw_ip):
         return f"ip route show default metric 0 proto 111 | grep -q '{gw_ip}'"
 
-    def not_in_ecmp(gw_ip):
-        return f"ip route show default metric 0 proto 111 | grep -qv '{gw_ip}'"
+    def in_ecmp6(dev):
+        return f"ip -6 route show default metric 5 proto 111 | grep -q '{V6_NEXTHOP[dev]}'"
 
-    # ── 0. Initial state: all five gateways healthy and in ECMP ──────────────
+    # ── 0. Initial state: all five gateways healthy and in both routes ───────
     with subtest("initial: all gateways start healthy and appear in ECMP"):
         for gw in ["10.0.1.1", "10.0.2.1", "10.0.3.1", "10.0.4.1", "10.0.5.1"]:
             machine.wait_until_succeeds(in_ecmp(gw), timeout=15)
+        for dev in V6_NEXTHOP:
+            machine.wait_until_succeeds(in_ecmp6(dev), timeout=15)
 
     # ── 1. ICMP probe ────────────────────────────────────────────────────────
-    # Simulate link failure by dropping ICMP echo requests on router1.
-    # With 2-of-2 threshold at 1 s interval, the gateway is removed in ≤ 3 s.
+    # Drop ICMP echo requests on router1 to simulate link failure.
 
     with subtest("icmp probe: gateway removed from ECMP when ICMP is blocked"):
         router1.succeed(
@@ -249,10 +257,21 @@ pkgs.testers.nixosTest {
         )
         machine.wait_until_succeeds(in_ecmp("10.0.1.1"), timeout=15)
 
+    # The same probe over ICMPv6, blocking only the v6 echo.
+    with subtest("icmp probe: only the IPv6 route moves when only ICMPv6 is blocked"):
+        router1.succeed(
+            "ip6tables -I INPUT -p icmpv6 --icmpv6-type echo-request -j DROP"
+        )
+        machine.wait_until_fails(in_ecmp6("eth1"), timeout=15)
+        machine.succeed(in_ecmp("10.0.1.1"))
+
+        router1.succeed(
+            "ip6tables -D INPUT -p icmpv6 --icmpv6-type echo-request -j DROP"
+        )
+        machine.wait_until_succeeds(in_ecmp6("eth1"), timeout=15)
+
     # ── 2. HTTP probe ────────────────────────────────────────────────────────
-    # Simulate server failure by stopping nginx on router2.
-    # eth2 (10.0.2.1) uses an HTTP probe; eth3 (10.0.3.1) a TCP probe — both
-    # share the same nginx.  Test HTTP failure/recovery first, then TCP below.
+    # Stop nginx on router2, which serves both the http and the tcp probe.
 
     with subtest("http probe: gateway removed from ECMP when HTTP server is down"):
         router2.succeed("systemctl stop nginx")
@@ -261,6 +280,15 @@ pkgs.testers.nixosTest {
     with subtest("http probe: gateway re-added to ECMP when HTTP server recovers"):
         router2.succeed("systemctl start nginx")
         machine.wait_until_succeeds(in_ecmp("10.0.2.1"), timeout=15)
+
+    # probe6 is the same nginx behind a bracketed IPv6 URL.
+    with subtest("http probe: an IPv6-only outage moves the IPv6 route alone"):
+        router2.succeed("ip6tables -I INPUT -i eth1 -p tcp --dport 80 -j DROP")
+        machine.wait_until_fails(in_ecmp6("eth2"), timeout=15)
+        machine.succeed(in_ecmp("10.0.2.1"))
+
+        router2.succeed("ip6tables -D INPUT -i eth1 -p tcp --dport 80 -j DROP")
+        machine.wait_until_succeeds(in_ecmp6("eth2"), timeout=15)
 
     # ── 3. TCP probe ─────────────────────────────────────────────────────────
     # Re-use router2's nginx — TCP connect to port 80 via the VLAN 3 interface.
@@ -273,6 +301,15 @@ pkgs.testers.nixosTest {
         router2.succeed("systemctl start nginx")
         machine.wait_until_succeeds(in_ecmp("10.0.3.1"), timeout=15)
 
+    # The v6 leg's host is a bare IPv6 literal, joined with net.JoinHostPort.
+    with subtest("tcp probe: an IPv6 host:port is spelled correctly and dialled"):
+        router2.succeed("ip6tables -I INPUT -i eth2 -p tcp --dport 80 -j DROP")
+        machine.wait_until_fails(in_ecmp6("eth3"), timeout=15)
+        machine.succeed(in_ecmp("10.0.3.1"))
+
+        router2.succeed("ip6tables -D INPUT -i eth2 -p tcp --dport 80 -j DROP")
+        machine.wait_until_succeeds(in_ecmp6("eth3"), timeout=15)
+
     # ── 4. DNS probe ─────────────────────────────────────────────────────────
     # Stop dnsmasq on router3 to simulate DNS resolver failure.
 
@@ -284,42 +321,60 @@ pkgs.testers.nixosTest {
         router3.succeed("systemctl start dnsmasq")
         machine.wait_until_succeeds(in_ecmp("10.0.4.1"), timeout=15)
 
-    # ── 5. Exec probe ────────────────────────────────────────────────────────
-    # The exec probe runs `test -f /run/health-exec-flag` on the machine
-    # itself; no peer VM is needed.  Removing the flag file causes probe
-    # failure; recreating it triggers recovery.
+    # The v6 resolver is configured with no port, the "host, or host:port" form.
+    with subtest("dns probe: a portless IPv6 resolver gets the default port"):
+        router3.succeed("ip6tables -I INPUT -p udp --dport 53 -j DROP")
+        machine.wait_until_fails(in_ecmp6("eth4"), timeout=15)
+        machine.succeed(in_ecmp("10.0.4.1"))
 
-    with subtest("exec probe: gateway removed from ECMP when command fails"):
+        router3.succeed("ip6tables -D INPUT -p udp --dport 53 -j DROP")
+        machine.wait_until_succeeds(in_ecmp6("eth4"), timeout=15)
+
+    # ── 5. Exec probe ────────────────────────────────────────────────────────
+    # The exec probe tests for a flag file; removing it fails both families.
+
+    with subtest("exec probe: gateway removed from both routes when command fails"):
         machine.succeed("rm /run/health-exec-flag")
         machine.wait_until_fails(in_ecmp("10.0.5.1"), timeout=15)
+        machine.wait_until_fails(in_ecmp6("eth5"), timeout=15)
 
-    with subtest("exec probe: gateway re-added to ECMP when command succeeds"):
+    with subtest("exec probe: gateway re-added to both routes when command succeeds"):
         machine.succeed("touch /run/health-exec-flag")
         machine.wait_until_succeeds(in_ecmp("10.0.5.1"), timeout=15)
+        machine.wait_until_succeeds(in_ecmp6("eth5"), timeout=15)
 
     # ── 6. All-gateways-unhealthy: retain last ECMP route ────────────────────
-    # When every probe fails simultaneously, route-balancer must NOT delete the
-    # ECMP route (it logs a warning and keeps the last known-good state).
+    # Every probe failing at once must keep the last known-good route.
 
     with subtest("all gateways unhealthy: ECMP route is retained"):
         router1.succeed(
             "iptables -I INPUT -p icmp --icmp-type echo-request -j DROP"
+        )
+        # Both families of eth1, so IPv6 is genuinely all-unhealthy too.
+        router1.succeed(
+            "ip6tables -I INPUT -p icmpv6 --icmpv6-type echo-request -j DROP"
         )
         router2.succeed("systemctl stop nginx")
         router3.succeed("systemctl stop dnsmasq")
         machine.succeed("rm -f /run/health-exec-flag")
         # Give health monitors time to detect all failures.
         machine.sleep(5)
-        # The route must still exist (daemon retains it when all gateways fail).
-        machine.succeed("ip route show default metric 0 proto 111")
+        # The routes must still exist. Retention is per family.
+        machine.succeed("ip route show default metric 0 proto 111 | grep -q .")
+        machine.succeed("ip -6 route show default metric 5 proto 111 | grep -q .")
         # Restore everything.
         router1.succeed(
             "iptables -D INPUT -p icmp --icmp-type echo-request -j DROP"
+        )
+        router1.succeed(
+            "ip6tables -D INPUT -p icmpv6 --icmpv6-type echo-request -j DROP"
         )
         router2.succeed("systemctl start nginx")
         router3.succeed("systemctl start dnsmasq")
         machine.succeed("touch /run/health-exec-flag")
         for gw in ["10.0.1.1", "10.0.2.1", "10.0.3.1", "10.0.4.1", "10.0.5.1"]:
             machine.wait_until_succeeds(in_ecmp(gw), timeout=30)
+        for dev in V6_NEXTHOP:
+            machine.wait_until_succeeds(in_ecmp6(dev), timeout=30)
   '';
 }

@@ -1,20 +1,14 @@
-# nix/tests/route-balancer.nix
-#
-# NixOS VM integration test for route-balancer.
-# Run with: nix build .#checks.x86_64-linux.route-balancer-vm
-
 { pkgs }:
 
 pkgs.testers.nixosTest {
   name = "route-balancer";
 
-  # ── Test node ──────────────────────────────────────────────────────────────
   nodes.machine = { lib, pkgs, ... }: {
     imports = [ (import ../module/route-balancer.nix) ];
 
-    # Three extra vlans: eth1 and eth2 are configured gateways; eth3 is
-    # deliberately absent from the gateways config to test exclusion.
     virtualisation.vlans = [ 1 2 3 ];
+
+    environment.systemPackages = [ pkgs.iptables ];
 
     networking = {
       useDHCP = lib.mkForce false;
@@ -33,19 +27,19 @@ pkgs.testers.nixosTest {
         eth1 = { weight = 1; };
         eth2 = { weight = 1; };
       };
-      # Exercise the new configurable fields explicitly so the generated
-      # config file is tested end-to-end with non-default-looking values
-      # that are still functionally equivalent to the defaults.
       routeProto = 111;
       routeTableOffset = 100;
       iptablesChain = "ROUTE-BALANCER";
       nftablesTable = "route-balancer";
-      # Short interval so the reconcile test does not have to wait long.
       reconcileInterval = "3s";
+
+      rules = [
+        { matchDstPort = [ 443 8443 ]; matchProtocol = "tcp"; gateway = "eth1"; }
+        { matchDstPort = [ 53 ]; matchProtocol = "udp"; gateway = "eth2"; }
+      ];
     };
   };
 
-  # ── Test script ────────────────────────────────────────────────────────────
   testScript = ''
     machine.wait_for_unit("network.target")
     machine.wait_for_unit("route-balancer.service")
@@ -59,8 +53,7 @@ pkgs.testers.nixosTest {
     table3 = 100 + eth3_idx
 
     # ── 1. Reactive: first gateway ───────────────────────────────────────────
-    # Add a default route at a high metric so route-balancer can install its
-    # own ECMP route at metric 0 without conflicting with the kernel route.
+    # A default route at a high metric leaves metric 0 free for the daemon.
     with subtest("reactive: first gateway is installed"):
         machine.succeed("ip route add default via 10.0.1.1 dev eth1 metric 500")
         # route-balancer installs its ECMP route at metric 0 with proto 111.
@@ -92,8 +85,7 @@ pkgs.testers.nixosTest {
         )
 
     # ── 2. Reactive: second gateway triggers ECMP ────────────────────────────
-    # A second default route → daemon updates its ECMP route in-place
-    # (replace, since proto 111 route is already at metric 0).
+    # A second default route updates the ECMP route in place.
     with subtest("reactive: second gateway produces ECMP"):
         machine.succeed("ip route add default via 10.0.2.1 dev eth2 metric 600")
         machine.wait_until_succeeds(
@@ -186,10 +178,7 @@ pkgs.testers.nixosTest {
         )
 
     # ── 5. Reconcile: externally modified state is restored ──────────────────
-    # After test 4 both gateways are in ECMP and the daemon is running.
-    # Verify that the reconciler (3 s interval) restores each kind of state
-    # that can be externally modified: the ECMP route, a per-gateway table,
-    # and a split-access ip rule.
+    # The reconciler restores the ECMP route, a per-gateway table and an ip rule.
     with subtest("reconcile: ECMP route deleted externally is restored"):
         machine.succeed("ip route del default proto 111")
         machine.wait_until_fails(
@@ -236,16 +225,112 @@ pkgs.testers.nixosTest {
             timeout=15,
         )
 
+    # ── 6. Port rules: mangle chain and fwmark ip rules ──────────────────────
+    # Marks are the 1-based index into the sorted gateway names.
+    with subtest("port rules: mangle chain and fwmark rules are installed"):
+        machine.wait_until_succeeds(
+            "iptables -t mangle -S ROUTE-BALANCER | grep -q 'multiport --dports 443,8443'",
+            timeout=15,
+        )
+        machine.succeed(
+            "iptables -t mangle -S ROUTE-BALANCER | grep -q 'udp --dport 53'"
+        )
+        # Both hooks jump into the chain: OUTPUT for traffic this host
+        # originates, PREROUTING for traffic it forwards. Not FORWARD — a
+        # forwarded packet is routed before it gets there, so a mark stamped
+        # in FORWARD arrives after the decision it exists to influence.
+        machine.succeed("iptables -t mangle -S OUTPUT | grep -q ROUTE-BALANCER")
+        machine.succeed("iptables -t mangle -S PREROUTING | grep -q ROUTE-BALANCER")
+        machine.fail("iptables -t mangle -S FORWARD | grep -q ROUTE-BALANCER")
+        # ip rule prints the mark in hex, at priority 500 + mark.
+        machine.wait_until_succeeds(
+            f"ip rule show | grep -q '^501:.*fwmark 0x1 lookup {table1}'",
+            timeout=15,
+        )
+        machine.wait_until_succeeds(
+            f"ip rule show | grep -q '^502:.*fwmark 0x2 lookup {table2}'",
+            timeout=15,
+        )
+
+    # ── 6b. The other half of the mechanism drifts too ───────────────────────
+    # The mangle chain stamps a mark and an ip rule reads it; both are reconciled.
+    with subtest("reconcile: flushed mangle chain is restored"):
+        machine.succeed("iptables -t mangle -F ROUTE-BALANCER")
+        machine.wait_until_fails(
+            "iptables -t mangle -S ROUTE-BALANCER | grep -q 'multiport --dports 443,8443'",
+            timeout=5,
+        )
+        machine.wait_until_succeeds(
+            "iptables -t mangle -S ROUTE-BALANCER | grep -q 'multiport --dports 443,8443'",
+            timeout=15,
+        )
+        machine.succeed(
+            "iptables -t mangle -S ROUTE-BALANCER | grep -q 'udp --dport 53'"
+        )
+        # And the fwmark rule that reads those marks is still there.
+        machine.succeed(f"ip rule show | grep -q '^501:.*fwmark 0x1 lookup {table1}'")
+
+    # A correct chain can also be left unreachable: a flushed OUTPUT takes the
+    # jump with it, which no contents check would see.
+    with subtest("reconcile: deleted mangle jump is restored"):
+        machine.succeed("iptables -t mangle -D OUTPUT -j ROUTE-BALANCER")
+        machine.wait_until_fails(
+            "iptables -t mangle -S OUTPUT | grep -q ROUTE-BALANCER",
+            timeout=5,
+        )
+        machine.wait_until_succeeds(
+            "iptables -t mangle -S OUTPUT | grep -q ROUTE-BALANCER",
+            timeout=15,
+        )
+        machine.succeed("iptables -t mangle -S PREROUTING | grep -q ROUTE-BALANCER")
+        # The rebuild is the whole chain, so its contents came back with it.
+        machine.succeed(
+            "iptables -t mangle -S ROUTE-BALANCER | grep -q 'multiport --dports 443,8443'"
+        )
+
+    # SIGKILL leaves the chain standing, and the daemon coming back up must
+    # adopt it rather than rebuild it.
+    with subtest("startup adopts a mangle chain that survived a crash"):
+        before = machine.succeed("iptables -t mangle -S ROUTE-BALANCER")
+        machine.succeed("systemctl kill -s SIGKILL route-balancer.service || true")
+        machine.wait_until_fails("systemctl is-active route-balancer.service", timeout=15)
+        # Nothing cleaned up, so the chain is exactly as the daemon left it.
+        assert before == machine.succeed("iptables -t mangle -S ROUTE-BALANCER"), (
+            "SIGKILL removed the mangle chain, so this subtest is testing nothing"
+        )
+
+        # A journal cursor rather than a timestamp: --since has one-second
+        # granularity, which is coarser than the gap to the previous subtest.
+        cursor = machine.succeed(
+            "journalctl -u route-balancer.service -n 1 -o export "
+            "| sed -n 's/^__CURSOR=//p'"
+        ).strip()
+        machine.systemctl("start route-balancer.service")
+        machine.wait_for_unit("route-balancer.service")
+        machine.wait_until_succeeds(
+            "ip route show default metric 0 | grep -q 'proto 111'",
+            timeout=15,
+        )
+
+        assert before == machine.succeed("iptables -t mangle -S ROUTE-BALANCER"), (
+            "the mangle chain changed across a startup that found it correct"
+        )
+        applied = machine.succeed(
+            f"journalctl -u route-balancer.service --after-cursor='{cursor}' "
+            "| grep -c 'Installing.*mangle-marks' || true"
+        ).strip()
+        assert applied == "0", (
+            f"the chain was reinstalled {applied} time(s) on a startup that "
+            "found it already correct"
+        )
+
     # ── 7. Unconfigured interface is excluded from ECMP ──────────────────────
     # eth3 has an IP and a default route but is absent from the gateways config.
-    # The daemon must ignore it: no nexthop in the ECMP route, no per-gateway
-    # routing table, and no ip rule.
     with subtest("unconfigured interface is excluded from ECMP"):
         machine.systemctl("start route-balancer.service")
         machine.wait_for_unit("route-balancer.service")
         machine.succeed("ip route add default via 10.0.3.1 dev eth3 metric 700")
-        # Give the daemon time to process the netlink event, then assert the
-        # unconfigured gateway never appears in the ECMP route.
+        # The unconfigured gateway must never appear in the ECMP route.
         machine.succeed("sleep 2")
         machine.fail(
             "ip route show default metric 0 | grep -q '10.0.3.1'",
@@ -263,8 +348,7 @@ pkgs.testers.nixosTest {
 
     # ── 8. Shutdown cleanup removes all route-balancer state ─────────────────
     with subtest("shutdown: ECMP route, tables, and ip rules are removed"):
-        # Restart so the daemon re-seeds eth1/eth2 routes and installs state
-        # that the shutdown path must then remove cleanly.
+        # Restart so there is state for the shutdown path to remove.
         machine.systemctl("restart route-balancer.service")
         machine.wait_for_unit("route-balancer.service")
         machine.wait_until_succeeds(
@@ -294,6 +378,45 @@ pkgs.testers.nixosTest {
         machine.wait_until_fails(
             f"ip rule show | grep -q 'from 10.0.2.2 lookup {table2}'",
             timeout=15,
+        )
+
+    # ── 9. Stopping the unit mid-startup leaves nothing behind ───────────────
+    # A stop arriving at any point in startup must leave no managed state. The
+    # delays sweep the window rather than aiming at one point in it.
+    delays = ["0", "0.02", "0.05", "0.1", "0.2", "0.4", "0.8"]
+
+    # Count earlier starts so the check below reads only the sweep's own.
+    starts_before = int(machine.succeed(
+        "journalctl -u route-balancer.service --no-pager -o cat"
+        " | grep -c 'route-balancer starting' || true"
+    ).strip())
+
+    for delay in delays:
+        with subtest(f"stop {delay}s into startup leaves nothing behind"):
+            # One round trip for the whole cycle, so delay 0 is as early as the
+            # harness can signal. reset-failed clears systemd's start rate limit.
+            machine.succeed(
+                "systemctl reset-failed route-balancer.service; "
+                "systemctl start route-balancer.service && "
+                f"sleep {delay} && "
+                "systemctl stop route-balancer.service"
+            )
+            # No wait_until_fails: `systemctl stop` is synchronous.
+            machine.fail("ip route show default metric 0 | grep -q 'proto 111'")
+            machine.fail(f"ip route show table {table1} | grep -q .")
+            machine.fail(f"ip route show table {table2} | grep -q .")
+            machine.fail(f"ip rule show | grep -q 'lookup {table1}'")
+            machine.fail(f"ip rule show | grep -q 'lookup {table2}'")
+            machine.fail("iptables -t mangle -S | grep -q ROUTE-BALANCER")
+
+    # The sweep only means something if at least one iteration got far enough
+    # to have state to leave behind.
+    with subtest("the sweep ran a daemon that got somewhere"):
+        journal = machine.succeed("journalctl -u route-balancer.service --no-pager -o cat")
+        sweep_runs = journal.split("route-balancer starting")[1:][starts_before:]
+        assert [r for r in sweep_runs if "Applying ECMP route" in r], (
+            "no sweep invocation reached the first pass, so none of them had any "
+            "managed state to leave behind; lengthen the delays"
         )
   '';
 }

@@ -16,3 +16,14 @@
 
 # QEMU
 *.qcow2
+
+# mdBook — /book is the rendered site, and mermaid.min.js is written into the
+# working tree by `nix run .#docs` (2.6 MB, extracted from the mdbook-mermaid
+# binary). mermaid-init.js is *not* generated: ours lives in nix/docs/.
+/book/
+/mermaid.min.js
+/mermaid-init.js
+
+# Generated from nix/module/route-balancer.nix by both ways of building the
+# book, which is the point of it: a page that cannot be edited cannot drift.
+/docs/module-options.md
